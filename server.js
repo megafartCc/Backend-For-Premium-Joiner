@@ -1,318 +1,268 @@
 const express = require('express');
 const cors = require('cors');
 const app = express();
+
 app.use(cors());
-// Increased JSON body limit to 50mb to handle larger payloads
 app.use(express.json({ limit: '50mb' }));
 
-// --- 🔒 SECRET KEY (from Environment Variable) ---
-// This key MUST EXACTLY match the one in your decryption client script.
-// It's loaded from an environment variable for security.
-const SECRET_KEY = process.env.SECRET_KEY || 'default_dev_key_change_this_123';
+// --- SECRET KEY ---
+// Must match the client; default set to the shared key, but can be overridden by env.
+const SECRET_KEY =
+  process.env.SECRET_KEY || 'A7q#zP!t8*K$vB2@cM5nF&hW9gL^eR4u';
 
-// Startup check to ensure a secret key is provided
 if (!SECRET_KEY || SECRET_KEY === 'default_dev_key_change_this_123') {
-    console.warn("⚠️ WARNING: No SECRET_KEY environment variable set. Using a default, insecure key for development.");
+  console.warn(
+    'WARNING: No SECRET_KEY env set or using insecure default. Override SECRET_KEY in the environment.'
+  );
 }
 
-
-/**
- * Encrypts a string using a Vigenère-style additive cipher and then encodes it in Hex.
- * This is the counterpart to the decryption logic in your Luau script.
- * @param {string} text The plaintext to encrypt.
- * @param {string} key The secret key.
- * @returns {string} The Hex-encoded encrypted string.
- */
 function encrypt(text, key) {
-    let result = '';
-    for (let i = 0; i < text.length; i++) {
-        const textCharCode = text.charCodeAt(i);
-        const keyCharCode = key.charCodeAt(i % key.length);
-        // Add the character codes, using modulo 256 to ensure the result is a valid byte.
-        const encryptedCharCode = (textCharCode + keyCharCode) % 256;
-        result += String.fromCharCode(encryptedCharCode);
-    }
-    // Encode the raw binary string to Hex to ensure it's safe for HTTP transport.
-    return Buffer.from(result, 'binary').toString('hex');
+  let result = '';
+  for (let i = 0; i < text.length; i++) {
+    const t = text.charCodeAt(i);
+    const k = key.charCodeAt(i % key.length);
+    result += String.fromCharCode((t + k) % 256);
+  }
+  return Buffer.from(result, 'binary').toString('hex');
 }
 
+function decryptPayload(hex, key) {
+  if (typeof hex !== 'string' || typeof key !== 'string' || key.length === 0) {
+    return null;
+  }
+  const clean = hex.replace(/[^0-9a-fA-F]/g, '');
+  if (clean.length % 2 !== 0) return null;
+  const buf = Buffer.from(clean, 'hex');
+  let out = '';
+  for (let i = 0; i < buf.length; i++) {
+    const k = key.charCodeAt(i % key.length);
+    out += String.fromCharCode((buf[i] - k + 256) % 256);
+  }
+  return out;
+}
 
-// --- Data Storage and Cleanup (from your original code) ---
 const brainrots = new Map();
 const activePlayers = new Map();
 
-// Timeouts remain to ensure data eventually expires
-const BRAINROT_LIVETIME_MS = 0.5 * 1000; // 5 seconds
-const PLAYER_TIMEOUT_MS = 5 * 1000;   // 5 seconds
+const BRAINROT_LIVETIME_MS = 500; // 0.5s
+const PLAYER_TIMEOUT_MS = 5000; // 5s
 
 function now() {
-  return Date.now();
+  return Date.now();
 }
 
-// Optimized cleanup: Only removes players by time, no size limit enforcement.
 function cleanupInactivePlayers() {
-  const cutoff = now() - PLAYER_TIMEOUT_MS;
-  
-  for (const [key, player] of activePlayers) {
-    if (player.lastSeen < cutoff) {
-      activePlayers.delete(key);
-    }
-  }
+  const cutoff = now() - PLAYER_TIMEOUT_MS;
+  for (const [key, player] of activePlayers) {
+    if (player.lastSeen < cutoff) {
+      activePlayers.delete(key);
+    }
+  }
 }
 
-// Optimized cleanup: Only removes brainrots by time, no size limit enforcement.
 function cleanupOldBrainrots() {
-  const livetimeCutoff = now() - BRAINROT_LIVETIME_MS;
-
-  for (const [key, br] of brainrots) {
-    if (br.lastSeen < livetimeCutoff) {
-      brainrots.delete(key);
-    }
-  }
+  const cutoff = now() - BRAINROT_LIVETIME_MS;
+  for (const [key, br] of brainrots) {
+    if (br.lastSeen < cutoff) {
+      brainrots.delete(key);
+    }
+  }
 }
 
-// Minimal player heartbeat - optimized for speed
 app.post('/players/heartbeat', (req, res) => {
-  const { username, serverId, jobId, placeId } = req.body;
-  
-  if (!username || !serverId || !jobId) {
-    // Fast exit for invalid data
-    return res.status(400).json({ error: "Missing username, serverId, or jobId" });
-  }
-  
-  const key = `${username.toLowerCase()}_${serverId}_${jobId}`;
-  
-  activePlayers.set(key, {
-    username: username,
-    serverId: serverId,
-    jobId: jobId,
-    placeId: placeId || serverId,
-    lastSeen: now()
-  });
-  
-  // No cleanup call here to respond as fast as possible. Cleanup is handled by the interval.
-  res.json({ success: true });
+  const { username, serverId, jobId, placeId } = req.body;
+  if (!username || !serverId || !jobId) {
+    return res.status(400).json({ error: 'Missing username, serverId, or jobId' });
+  }
+  const key = `${username.toLowerCase()}_${serverId}_${jobId}`;
+  activePlayers.set(key, {
+    username,
+    serverId,
+    jobId,
+    placeId: placeId || serverId,
+    lastSeen: now(),
+  });
+  res.json({ success: true });
 });
 
-// Active players endpoint - no response limit
 app.get('/players/active', (req, res) => {
-  // Run cleanup just before sending to ensure data is fresh
-  cleanupInactivePlayers();
-  
-  const allPlayers = Array.from(activePlayers.values()).map(player => ({
-    username: player.username,
-    serverId: player.serverId,
-    jobId: player.jobId,
-    placeId: player.placeId,
-    secondsSinceLastSeen: Math.floor((now() - player.lastSeen) / 1000)
-  }));
-  
-  res.json(allPlayers);
+  cleanupInactivePlayers();
+  const allPlayers = Array.from(activePlayers.values()).map((p) => ({
+    username: p.username,
+    serverId: p.serverId,
+    jobId: p.jobId,
+    placeId: p.placeId,
+    secondsSinceLastSeen: Math.floor((now() - p.lastSeen) / 1000),
+  }));
+  res.json(allPlayers);
 });
 
-// Brainrots endpoint - optimized for fast ingestion
 app.post('/brainrots', (req, res) => {
-  const data = req.body;
+  let data = req.body;
 
-  let name = typeof data.name === "string" ? data.name.trim() : "";
-  let serverId = typeof data.serverId === "string" ? data.serverId.trim() : "";
-  let jobId = typeof data.jobId === "string" ? data.jobId.trim() : "";
+  // If encrypted payload provided, decrypt it first.
+  if (data && typeof data.payload === 'string') {
+    const decrypted = decryptPayload(data.payload, SECRET_KEY);
+    if (!decrypted) {
+      return res.status(400).json({ error: 'Bad encrypted payload' });
+    }
+    try {
+      data = JSON.parse(decrypted);
+    } catch (err) {
+      return res.status(400).json({ error: 'Malformed decrypted JSON' });
+    }
+  }
 
-  if (!name || !serverId || !jobId) {
-    return res.status(400).json({ error: "Missing name, serverId, or jobId" });
-  }
+  let name = typeof data.name === 'string' ? data.name.trim() : '';
+  let serverId = typeof data.serverId === 'string' ? data.serverId.trim() : '';
+  let jobId = typeof data.jobId === 'string' ? data.jobId.trim() : '';
 
-  const source = req.ip?.includes('railway') || req.headers['x-forwarded-for']?.includes('railway') ? 'bot' : 'lua';
-  const key = `${serverId}_${name.toLowerCase()}_${jobId}`;
+  if (!name || !serverId || !jobId) {
+    return res.status(400).json({ error: 'Missing name, serverId, or jobId' });
+  }
 
-  const entry = {
-    name: name,
-    serverId: serverId,
-    jobId: jobId,
-    players: data.players,
-    moneyPerSec: data.moneyPerSec,
-    lastSeen: now(),
-    active: true,
-    source: source
-  };
+  const source =
+    (req.ip && req.ip.includes('railway')) ||
+    (req.headers['x-forwarded-for'] || '').toString().includes('railway')
+      ? 'bot'
+      : 'lua';
+  const key = `${serverId}_${name.toLowerCase()}_${jobId}`;
 
-  brainrots.set(key, entry);
+  brainrots.set(key, {
+    name,
+    serverId,
+    jobId,
+    players: data.players,
+    moneyPerSec: data.moneyPerSec,
+    lastSeen: now(),
+    active: true,
+    source,
+  });
 
-  // No cleanup call here to respond as fast as possible. Cleanup is handled by the interval.
-  res.json({ success: true });
+  res.json({ success: true });
 });
 
-// --- MODIFIED ENDPOINT ---
-// Brainrots getter - This now sends encrypted data.
 app.get('/brainrots', (req, res) => {
-  // Run cleanup just before sending to ensure data is fresh
-  cleanupOldBrainrots();
-
-  const activeBrainrots = [];
-  const cutoff = now() - BRAINROT_LIVETIME_MS;
-  
-  for (const br of brainrots.values()) {
-    if (br.lastSeen >= cutoff) {
-      activeBrainrots.push({
-        name: br.name,
-        serverId: br.serverId,
-        jobId: br.jobId,
-        players: br.players,
-        moneyPerSec: br.moneyPerSec,
-        lastSeen: br.lastSeen,
-        source: br.source
-      });
-    }
-  }
-
-  // Sort by newest first, but send everything
-  activeBrainrots.sort((a, b) => b.lastSeen - a.lastSeen);
-  
-  // 1. Convert the array of objects to a JSON string.
-  const jsonString = JSON.stringify(activeBrainrots);
-  
-  // 2. Encrypt the JSON string using our function.
-  const encryptedData = encrypt(jsonString, SECRET_KEY);
-  
-  // 3. Send the encrypted hex string inside a JSON object, as the Luau script expects.
-  res.json({ payload: encryptedData });
+  cleanupOldBrainrots();
+  const cutoff = now() - BRAINROT_LIVETIME_MS;
+  const activeList = [];
+  for (const br of brainrots.values()) {
+    if (br.lastSeen >= cutoff) {
+      activeList.push({
+        name: br.name,
+        serverId: br.serverId,
+        jobId: br.jobId,
+        players: br.players,
+        moneyPerSec: br.moneyPerSec,
+        lastSeen: br.lastSeen,
+        source: br.source,
+      });
+    }
+  }
+  activeList.sort((a, b) => b.lastSeen - a.lastSeen);
+  const encryptedData = encrypt(JSON.stringify(activeList), SECRET_KEY);
+  res.json({ payload: encryptedData });
 });
 
-// Debug endpoint with no limits
-app.get('/brainrots/debug', (req, res) => {
-  cleanupOldBrainrots();
-
-  let activeCount = 0;
-  let expiredCount = 0;
-  const activeList = [];
-  
-  const cutoff = now() - BRAINROT_LIVETIME_MS;
-  
-  for (const br of brainrots.values()) {
-    if (br.lastSeen >= cutoff) {
-      activeCount++;
-      activeList.push({
-        name: br.name,
-        serverId: br.serverId.substring(0, 8) + '...',
-        jobId: br.jobId.substring(0, 8) + '...',
-        players: br.players,
-        moneyPerSec: br.moneyPerSec,
-        secondsSinceLastSeen: Math.floor((now() - br.lastSeen) / 1000)
-      });
-    } else {
-      expiredCount++;
-    }
-  }
-
-  const debugData = {
-    summary: {
-      totalStored: brainrots.size,
-      activeCount: activeCount,
-      expiredCount: expiredCount,
-      limits: {
-        maxBrainrots: "Unlimited",
-        maxPlayers: "Unlimited"
-      }
-    },
-    active: activeList
-  };
-
-  res.json(debugData);
-});
-
-// Stats endpoint reflecting unlimited nature
-app.get('/brainrots/stats', (req, res) => {
-  let activeCount = 0;
-  let luaCount = 0;
-  let botCount = 0;
-  
-  const cutoff = now() - BRAINROT_LIVETIME_MS;
-  
-  for (const br of brainrots.values()) {
-    if (br.lastSeen >= cutoff) {
-      activeCount++;
-      if (br.source === 'lua') luaCount++;
-      else if (br.source === 'bot') botCount++;
-    }
-  }
-
-  res.json({
-    totalActive: activeCount,
-    totalPlayers: activePlayers.size,
-    bySource: {
-      lua: luaCount,
-      bot: botCount
-    },
-    uptime: Math.floor(process.uptime()),
-    limits: {
-      brainrots: `${brainrots.size} (Unlimited)`,
-      players: `${activePlayers.size} (Unlimited)`
-    }
-  });
-});
-
-// Admin endpoints
 app.delete('/brainrots', (req, res) => {
-  const count = brainrots.size;
-  brainrots.clear();
-  res.json({ success: true, cleared: count });
+  const count = brainrots.size;
+  brainrots.clear();
+  res.json({ success: true, cleared: count });
 });
 
 app.patch('/brainrots/leave', (req, res) => {
-  let { name, serverId, jobId } = req.body;
-  name = typeof name === "string" ? name.trim() : "";
-  serverId = typeof serverId === "string" ? serverId.trim() : "";
-  jobId = typeof jobId === "string" ? jobId.trim() : "";
-
-  const key = `${serverId}_${name.toLowerCase()}_${jobId}`;
-  brainrots.delete(key);
-
-  res.json({ success: true });
+  let { name, serverId, jobId } = req.body;
+  name = typeof name === 'string' ? name.trim() : '';
+  serverId = typeof serverId === 'string' ? serverId.trim() : '';
+  jobId = typeof jobId === 'string' ? jobId.trim() : '';
+  const key = `${serverId}_${name.toLowerCase()}_${jobId}`;
+  brainrots.delete(key);
+  res.json({ success: true });
 });
 
-// Health check root page
 app.get('/', (req, res) => {
-  let activeCount = 0;
-  const cutoff = now() - BRAINROT_LIVETIME_MS;
-  
-  for (const br of brainrots.values()) {
-    if (br.lastSeen >= cutoff) activeCount++;
-  }
-  
-  res.send(`
-    <h1>🧠 Encrypted Brainrot Backend</h1>
-    <p>The <code>/brainrots</code> endpoint is now encrypted.</p>
-    <hr>
-    <p><strong>Active Brainrots:</strong> ${activeCount}</p>
-    <p><strong>Active Players:</strong> ${activePlayers.size}</p>
-    <p><strong>Uptime:</strong> ${Math.floor(process.uptime())} seconds</p>
-    <hr>
-    <p><em>Limits have been removed for maximum performance. Monitor memory usage.</em></p>
-    <hr>
-    <p><a href="/players/active">👥 View Active Players (Unencrypted)</a></p>
-    <p><a href="/brainrots/debug">🔍 Debug Data (Unencrypted)</a></p>
-    <p><a href="/brainrots/stats">📈 Statistics (Unencrypted)</a></p>
-  `);
+  cleanupOldBrainrots();
+  let activeCount = 0;
+  const cutoff = now() - BRAINROT_LIVETIME_MS;
+  for (const br of brainrots.values()) {
+    if (br.lastSeen >= cutoff) activeCount++;
+  }
+  res.send(`
+    <h1>🧠 Encrypted Brainrot Backend</h1>
+    <p>The <code>/brainrots</code> endpoint is encrypted.</p>
+    <hr>
+    <p><strong>Active Brainrots:</strong> ${activeCount}</p>
+    <p><strong>Active Players:</strong> ${activePlayers.size}</p>
+    <p><strong>Uptime:</strong> ${Math.floor(process.uptime())} seconds</p>
+    <hr>
+    <p><a href="/players/active">👥 View Active Players (Unencrypted)</a></p>
+    <p><a href="/brainrots/debug">🔍 Debug Data (Unencrypted)</a></p>
+    <p><a href="/brainrots/stats">📈 Statistics (Unencrypted)</a></p>
+  `);
 });
 
-// Aggressive cleanup interval to manage memory from expired items
-setInterval(() => {
-  cleanupOldBrainrots();
-  cleanupInactivePlayers();
-}, 1000); // Shortened to 1 second for faster cleanup
+app.get('/brainrots/debug', (req, res) => {
+  cleanupOldBrainrots();
+  const cutoff = now() - BRAINROT_LIVETIME_MS;
+  let activeCount = 0;
+  let expiredCount = 0;
+  const activeList = [];
+  for (const br of brainrots.values()) {
+    if (br.lastSeen >= cutoff) {
+      activeCount++;
+      activeList.push({
+        name: br.name,
+        serverId: br.serverId,
+        jobId: br.jobId,
+        players: br.players,
+        moneyPerSec: br.moneyPerSec,
+        secondsSinceLastSeen: Math.floor((now() - br.lastSeen) / 1000),
+      });
+    } else {
+      expiredCount++;
+    }
+  }
+  res.json({
+    summary: {
+      totalStored: brainrots.size,
+      activeCount,
+      expiredCount,
+    },
+    active: activeList,
+  });
+});
 
-// Force garbage collection if available
+app.get('/brainrots/stats', (req, res) => {
+  cleanupOldBrainrots();
+  const cutoff = now() - BRAINROT_LIVETIME_MS;
+  let activeCount = 0;
+  let luaCount = 0;
+  let botCount = 0;
+  for (const br of brainrots.values()) {
+    if (br.lastSeen >= cutoff) {
+      activeCount++;
+      if (br.source === 'lua') luaCount++;
+      else if (br.source === 'bot') botCount++;
+    }
+  }
+  res.json({
+    totalActive: activeCount,
+    totalPlayers: activePlayers.size,
+    bySource: { lua: luaCount, bot: botCount },
+    uptime: Math.floor(process.uptime()),
+  });
+});
+
+setInterval(() => {
+  cleanupOldBrainrots();
+  cleanupInactivePlayers();
+}, 1000);
+
 if (global.gc) {
-  setInterval(() => {
-    global.gc();
-  }, 10000);
+  setInterval(() => global.gc(), 10000);
 }
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[${new Date().toISOString()}] 🚀 Unchained Brainrot Backend running on port ${PORT}`);
-  console.log(`[${new Date().toISOString()}] 🔐 Encryption ENABLED for /brainrots GET endpoint.`);
-  console.log(`[${new Date().toISOString()}] 📊 Memory limits: UNLIMITED`);
-  console.log(`[${new Date().toISOString()}] ⏱️ Timeouts: ${BRAINROT_LIVETIME_MS / 1000}s brainrot lifetime, ${PLAYER_TIMEOUT_MS / 1000}s heartbeat`);
-  console.log(`[${new Date().toISOString()}] ⚡️ Ready for maximum throughput!`);
+  console.log(`[${new Date().toISOString()}] Backend running on port ${PORT}`);
 });
